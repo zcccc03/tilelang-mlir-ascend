@@ -65,10 +65,19 @@ def batch_gemm(batch, m, n, k, block_m, block_n, block_k, cores=28):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--batch", type=int, default=28)
+    parser.add_argument("--m", type=int, default=1024)
+    parser.add_argument("--n", type=int, default=1024)
+    parser.add_argument("--k", type=int, default=1024)
+    parser.add_argument("--block-m", type=int, default=256)
+    parser.add_argument("--block-n", type=int, default=256)
+    parser.add_argument("--block-k", type=int, default=128)
+    parser.add_argument("--cores", type=int, default=28)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
-    batch, m, n, k = 28, 1024, 1024, 1024
-    kernel = tilelang.compile(batch_gemm(batch, m, n, k, 256, 256, 128), out_idx=-1, target="ascend")
+    batch, m, n, k = args.batch, args.m, args.n, args.k
+    program = batch_gemm(batch, m, n, k, args.block_m, args.block_n, args.block_k, args.cores)
+    kernel = tilelang.compile(program, out_idx=-1, target="ascend", execution_backend="tvm_ffi")
     if args.compile_only:
         print("COMPILE_PASS")
         return
@@ -79,7 +88,7 @@ def main():
     c = kernel(a.npu(), b.npu()).cpu()
 
     torch.testing.assert_close(c, a.float() @ b.float(), rtol=0, atol=0)
-    print("Batch GEMM passed for B=28, M=N=K=1024, BF16 to FP32.")
+    print(f"Batch GEMM passed for B={batch}, M={m}, N={n}, K={k}, BF16 to FP32.")
 
 
 if __name__ == "__main__":

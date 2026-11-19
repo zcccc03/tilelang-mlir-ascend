@@ -91,7 +91,7 @@ def main():
         args.stages,
         args.swizzle_window,
     )
-    kernel = tilelang.compile(program, out_idx=-1, target="ascend")
+    kernel = tilelang.compile(program, out_idx=-1, target="ascend", execution_backend="tvm_ffi")
     if args.compile_only:
         print("COMPILE_PASS")
         return

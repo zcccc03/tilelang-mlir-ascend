@@ -8,6 +8,13 @@ import tilelang
 import tilelang.testing
 from example_batch_gemm import batch_gemm as batch_gemm_bf16
 from example_batch_gemm_persistent import batch_gemm as batch_gemm_fp16
+from example_gemm import ascend_matmul
+
+
+pytestmark = pytest.mark.skipif(
+    not tilelang.testing.ascend_backend_compiled(),
+    reason="Ascend code generation is not built",
+)
 
 
 @pytest.mark.parametrize("persistent", [False, True], ids=["bf16", "fp16-swizzle"])
@@ -22,6 +29,8 @@ def test_batch_gemm_lowering(persistent, case):
         program = batch_gemm_fp16(*args, window=3) if persistent else batch_gemm_bf16(*args)
     artifact = tilelang.lower(program, target="ascend")
     assert artifact.kernel_source
+    assert "__cube__" in artifact.kernel_source
+    assert "asc_mmad" in artifact.kernel_source or "ascend_gemm_l1" in artifact.kernel_source
 
 
 @tilelang.testing.requires_ascend
@@ -47,3 +56,38 @@ def test_batch_gemm_correctness(persistent, batch, m, n, k, cores, window):
 
 if __name__ == "__main__":
     tilelang.testing.main()
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["bf16", "fp16-swizzle"])
+@pytest.mark.parametrize("tile", [(256, 256, 64), (128, 128, 128)])
+def test_batch_gemm_requested_tiles(persistent, tile):
+    factory = batch_gemm_fp16 if persistent else batch_gemm_bf16
+    artifact = tilelang.lower(factory(28, 1024, 1024, 1024, *tile), target="ascend")
+    assert "__cube__" in artifact.kernel_source
+    assert "asc_mmad" in artifact.kernel_source or "ascend_gemm_l1" in artifact.kernel_source
+
+
+def test_ascend_gemm_fp32_output_lowering():
+    # Regression: the generic GPU example used an FP32 fragment -> FP16 DMA copy.
+    program = ascend_matmul(1024, 1024, 1024)
+    assert str(program.buffer_map[program.params[-1]].dtype) == "float32"
+    artifact = tilelang.lower(program, target="ascend")
+    assert "__cube__" in artifact.kernel_source
+    assert "asc_mmad" in artifact.kernel_source or "ascend_gemm_l1" in artifact.kernel_source
+
+
+@tilelang.testing.requires_ascend
+def test_ascend_gemm_correctness():
+    from example_gemm import main_ascend
+
+    main_ascend()
+
+
+def test_gemm_main_selects_ascend(monkeypatch):
+    import example_gemm
+
+    monkeypatch.setenv("TILELANG_DEFAULT_TARGET", "ascend")
+    calls = []
+    monkeypatch.setattr(example_gemm, "main_ascend", lambda compile_only=False: calls.append(compile_only))
+    example_gemm.main(compile_only=True)
+    assert calls == [True]

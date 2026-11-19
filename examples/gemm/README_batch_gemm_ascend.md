@@ -12,6 +12,16 @@ USE_ASCEND=ON USE_CUDA=OFF python -m pip install -v .
 
 Configure CANN and install compatible PyTorch and `torch_npu` packages first.
 Run the commands below from the repository root with that TileLang installation.
+For a source checkout, put this repository first on Python's import path:
+
+```bash
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export TILELANG_DEFAULT_TARGET=ascend
+```
+
+`python -c 'import tilelang; print(tilelang.__file__)'` must point to this
+checkout, rather than a neighboring `tilelang` repository. These examples
+explicitly select `target="ascend"` and `execution_backend="tvm_ffi"`.
 
 ## Examples
 
@@ -52,3 +62,44 @@ Lowering tests cover the default kernels, a single K tile, a partial core wave,
 and a final swizzle window. Hardware tests check both input layouts against
 independent FP32 PyTorch references, including fewer tiles than cores and
 multiple batches. Hardware tests skip when no Ascend NPU is available.
+
+## The two requested tiles
+
+Both factories support batch 28 and M=N=K=1024 on 28 Cube cores. The ordinary
+example accepts shape and tile options:
+
+```bash
+python examples/gemm/example_batch_gemm.py --block-m 256 --block-n 256 --block-k 64
+python examples/gemm/example_batch_gemm.py --block-m 128 --block-n 128 --block-k 128
+python examples/gemm/example_batch_gemm_persistent.py --m 1024 --n 1024 --k 1024 --block-m 256 --block-n 256 --block-k 64
+python examples/gemm/example_batch_gemm_persistent.py --m 1024 --n 1024 --k 1024 --block-m 128 --block-n 128 --block-k 128
+```
+
+## Profiling and the FP32-to-FP16 copy error
+
+The reported command ran `example_gemm.py`, not a Batch GEMM example.
+The generic GPU kernel uses an FP32 register fragment and FP16 output;
+its copy implies a conversion that Ascend DMA cannot perform. On an Ascend
+target, `examples/gemm/example_gemm.py` now selects a dedicated BF16 GEMM
+with L1 inputs, an FP32 L0C accumulator and FP32 GM output. The GPU path stays
+available for GPU targets. All three Ascend examples write FP32 results
+from L0C, without an FP32-to-FP16 DMA cast.
+
+```bash
+TILELANG_DEFAULT_TARGET=ascend python examples/gemm/example_gemm.py --compile-only
+TILELANG_DEFAULT_TARGET=ascend python examples/gemm/example_gemm.py
+```
+
+Run Batch GEMM profiling from the repository root after correctness succeeds:
+
+```bash
+msopprof --warm-up=10 --aic-metrics=Roofline,InstrTimeline --launch-count=1 \
+  --output="$PWD/msopprof_out/batchgemm" \
+  python examples/gemm/example_batch_gemm.py --block-k 64
+```
+
+Omit the kernel-name filter until the actual kernel name is known.
+The original command combined a `batch` filter with an unrelated `matmul`
+kernel. Compilation failure also leaves no device kernel to profile;
+the empty-profiler message is secondary. Hardware correctness and MFU
+require execution on an Ascend NPU.
