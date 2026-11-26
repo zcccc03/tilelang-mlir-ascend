@@ -9,7 +9,9 @@ import tilelang.ascend.language as T
 import torch
 
 
-def batch_gemm(batch, m, n, k, block_m, block_n, block_k, cores=28, l1_k=None, stages=2, window=4, prefetch=True, split_m=1):
+def batch_gemm(
+    batch, m, n, k, block_m, block_n, block_k, cores=28, l1_k=None, stages=2, window=4, prefetch=True, split_m=1, unit_flag=True
+):
     if min(batch, m, n, k, block_m, block_n, block_k, cores, stages, window) <= 0:
         raise ValueError("Shapes, tile dimensions and core count must be positive")
     if block_m % 16 or block_n % 16 or block_k % 32:
@@ -18,6 +20,7 @@ def batch_gemm(batch, m, n, k, block_m, block_n, block_k, cores=28, l1_k=None, s
         raise ValueError("M, N and K must be divisible by their tile sizes")
     if split_m not in (1, 2) or (block_m // split_m) % 16:
         raise ValueError("Split M must leave a multiple-of-16 Cube tile")
+    uf_final, uf_partial = (3, 2) if unit_flag else (0, 0)
     tile_m = block_m // split_m
     m_tiles = m // block_m
     n_tiles = n // block_n
@@ -82,13 +85,27 @@ def batch_gemm(batch, m, n, k, block_m, block_n, block_k, cores=28, l1_k=None, s
                             T.copy(rhs[:, sub * l0_k : (sub + 1) * l0_k], rhs_l0)
                             if split_m == 2:
                                 T.copy(lhs[tile_m:, sub * l0_k : (sub + 1) * l0_k], lhs1_l0)
-                                T.gemm(lhs1_l0, rhs_l0, acc1, transpose_B=True, clear_accum=(kt == 0) & (sub == 0))
+                                T.gemm(
+                                    lhs1_l0,
+                                    rhs_l0,
+                                    acc1,
+                                    transpose_B=True,
+                                    clear_accum=(kt == 0) & (sub == 0),
+                                    unit_flag_ctrl=T.Select((kt == k // l1_k - 1) & (sub == l1_k // l0_k - 1), uf_final, uf_partial),
+                                )
                             T.copy(lhs[:tile_m, sub * l0_k : (sub + 1) * l0_k], lhs_l0)
-                            T.gemm(lhs_l0, rhs_l0, acc, transpose_B=True, clear_accum=(kt == 0) & (sub == 0))
+                            T.gemm(
+                                lhs_l0,
+                                rhs_l0,
+                                acc,
+                                transpose_B=True,
+                                clear_accum=(kt == 0) & (sub == 0),
+                                unit_flag_ctrl=T.Select((kt == k // l1_k - 1) & (sub == l1_k // l0_k - 1), uf_final, uf_partial),
+                            )
 
-                T.copy(acc, C[batch_id, row, col])
+                T.copy(acc, C[batch_id, row, col], unit_flag_ctrl=uf_final)
                 if split_m == 2:
-                    T.copy(acc1, C[batch_id, row + tile_m, col])
+                    T.copy(acc1, C[batch_id, row + tile_m, col], unit_flag_ctrl=uf_final)
 
     return batch_gemm_bf16.with_attr("l1_tile_k", l1_k).with_attr("l0_tile_k", l0_k).with_attr("prefetch_k", int(prefetch))
 
@@ -106,6 +123,7 @@ def main():
     parser.add_argument("--l1-k", type=int, default=None, help="GM-to-L1 K tile; default chooses up to 256")
     parser.add_argument("--stages", type=int, default=2)
     parser.add_argument("--swizzle-window", type=int, default=4)
+    parser.add_argument("--unit-flag", action=argparse.BooleanOptionalAction, default=True, help="use hardware Cube/Fixpipe handoff")
     parser.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--split-m", type=int, choices=[1, 2], default=1, help="use two half-height L0C slots")
     parser.add_argument("--compile-only", action="store_true")
@@ -125,12 +143,13 @@ def main():
         args.swizzle_window,
         args.prefetch,
         args.split_m,
+        args.unit_flag,
     )
     print(
         f"CONFIG BF16/BKN -> FP32 B={batch} M={m} N={n} K={k}; cores={args.cores}; "
         f"L1={args.block_m}x{args.block_n}x{program.attrs['l1_tile_k']}; "
         f"L0={args.block_m // args.split_m}x{args.block_n}x{program.attrs['l0_tile_k']}; "
-        f"split_m={args.split_m}; prefetch={program.attrs['prefetch_k']}",
+        f"split_m={args.split_m}; unit_flag={args.unit_flag}; prefetch={program.attrs['prefetch_k']}",
         flush=True,
     )
     kernel = tilelang.compile(program, out_idx=-1, target="ascend", execution_backend="tvm_ffi")
