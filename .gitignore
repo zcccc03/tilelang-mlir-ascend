@@ -130,3 +130,6 @@ maint/host_checks/logs/*
 
 # uv Lockfile
 uv.lock
+
+# Operator Harness project runs and simulator artifacts
+.workspace/
