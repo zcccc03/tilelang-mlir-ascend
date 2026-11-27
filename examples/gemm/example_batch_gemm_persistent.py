@@ -1,6 +1,6 @@
 # Copyright (c) Tile-AI Organization.
 # Licensed under the MIT License.
-"""FP16 Batch GEMM: A[B,M,K] @ B[B,N,K].T -> FP32."""
+"""BF16 BNK Batch GEMM with one AICORE assigned to each batch."""
 
 import tilelang
 import tilelang.ascend.language as T
@@ -9,19 +9,19 @@ import tilelang.ascend.language as T
 def batch_gemm(batch, M, N, K):
     batch_m, batch_n, batch_k = 256, 256, 256
     l0_k = 64
-    cores = 28
+    cores_per_batch = 1
+    cores = batch * cores_per_batch
     stages = 2
     prefetch = True
     window = 4
-    split_m = 2
-    dtype, out_dtype = "float16", "float32"
+    split_m = 1
+    dtype, out_dtype = "bfloat16", "float32"
     uf_partial, uf_final = 2, 3
 
     tile_m = batch_m // split_m
     m_tiles, n_tiles = M // batch_m, N // batch_n
     k_tiles, l0_tiles = K // batch_k, batch_k // l0_k
     tiles_per_batch = m_tiles * n_tiles
-    tiles = batch * tiles_per_batch
 
     @T.prim_func
     def batch_gemm_persistent(
@@ -32,17 +32,13 @@ def batch_gemm(batch, M, N, K):
         with T.Kernel(cores) as cid:
             lhs = T.alloc_l1((batch_m, batch_k), dtype)
             rhs = T.alloc_l1((batch_n, batch_k), dtype)
-            lhs0_l0 = T.alloc_l0a((tile_m, l0_k), dtype)
+            lhs_l0 = T.alloc_l0a((tile_m, l0_k), dtype)
             rhs_l0 = T.alloc_l0b((batch_n, l0_k), dtype)
-            acc0 = T.alloc_l0c((tile_m, batch_n), out_dtype)
-            T.annotate_buffer_versions({lhs: stages, rhs: stages, lhs0_l0: stages, rhs_l0: stages})
-            lhs1_l0 = T.alloc_l0a((tile_m, l0_k), dtype)
-            acc1 = T.alloc_l0c((tile_m, batch_n), out_dtype)
-            T.annotate_buffer_versions({lhs1_l0: stages})
+            acc = T.alloc_l0c((tile_m, batch_n), out_dtype)
+            T.annotate_buffer_versions({lhs: stages, rhs: stages, lhs_l0: stages, rhs_l0: stages})
 
-            for tile_id in T.Persistent([tiles], cores, cid, num_stages=stages):
-                batch_id = tile_id // tiles_per_batch
-                tile = tile_id % tiles_per_batch
+            batch_id = cid
+            for tile in T.Persistent([tiles_per_batch], cores_per_batch, 0, num_stages=stages):
                 group = tile // (n_tiles * window)
                 in_window = tile % (n_tiles * window)
                 row = (group * window + in_window % window) * batch_m
@@ -56,27 +52,17 @@ def batch_gemm(batch, M, N, K):
                     with T.Stage(stages - 1):
                         for sub in T.Pipelined(l0_tiles, num_stages=stages):
                             T.copy(rhs[:, sub * l0_k : (sub + 1) * l0_k], rhs_l0)
-                            T.copy(lhs[tile_m:, sub * l0_k : (sub + 1) * l0_k], lhs1_l0)
+                            T.copy(lhs[:, sub * l0_k : (sub + 1) * l0_k], lhs_l0)
                             T.gemm(
-                                lhs1_l0,
+                                lhs_l0,
                                 rhs_l0,
-                                acc1,
-                                transpose_B=True,
-                                clear_accum=(kt == 0) & (sub == 0),
-                                unit_flag_ctrl=T.Select((kt == k_tiles - 1) & (sub == l0_tiles - 1), uf_final, uf_partial),
-                            )
-                            T.copy(lhs[:tile_m, sub * l0_k : (sub + 1) * l0_k], lhs0_l0)
-                            T.gemm(
-                                lhs0_l0,
-                                rhs_l0,
-                                acc0,
+                                acc,
                                 transpose_B=True,
                                 clear_accum=(kt == 0) & (sub == 0),
                                 unit_flag_ctrl=T.Select((kt == k_tiles - 1) & (sub == l0_tiles - 1), uf_final, uf_partial),
                             )
 
-                T.copy(acc0, C[batch_id, row, col], unit_flag_ctrl=uf_final)
-                T.copy(acc1, C[batch_id, row + tile_m, col], unit_flag_ctrl=uf_final)
+                T.copy(acc, C[batch_id, row, col], unit_flag_ctrl=uf_final)
 
     return batch_gemm_persistent
 
@@ -86,7 +72,7 @@ def main(compile_only=False, bench=False):
 
     batch = 28
     M, N, K = 2048, 2048, 2048
-    dtype = torch.float16
+    dtype = torch.bfloat16
     kernel = tilelang.compile(batch_gemm(batch, M, N, K), out_idx=-1, target="ascend", execution_backend="tvm_ffi")
     if compile_only:
         print("COMPILE_PASS")

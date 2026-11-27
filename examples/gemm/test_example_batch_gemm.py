@@ -7,7 +7,7 @@ import torch
 import tilelang
 import tilelang.testing
 from example_batch_gemm import batch_gemm as batch_gemm_bf16
-from example_batch_gemm_persistent import batch_gemm as batch_gemm_fp16
+from example_batch_gemm_persistent import batch_gemm as batch_gemm_owned
 from example_gemm import ascend_matmul
 
 
@@ -17,21 +17,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("persistent", [False, True], ids=["bf16", "fp16-bnk"])
-def test_batch_gemm_lowering(persistent):
-    factory = batch_gemm_fp16 if persistent else batch_gemm_bf16
+@pytest.mark.parametrize("batch_owned", [False, True], ids=["distributed", "batch-owned"])
+def test_batch_gemm_lowering(batch_owned):
+    factory = batch_gemm_owned if batch_owned else batch_gemm_bf16
     artifact = tilelang.lower(factory(28, 2048, 2048, 2048), target="ascend")
     assert "__cube__" in artifact.kernel_source
     assert "asc_mmad" in artifact.kernel_source
 
 
 @tilelang.testing.requires_ascend
-@pytest.mark.parametrize("persistent", [False, True], ids=["bf16", "fp16-bnk"])
-def test_batch_gemm_correctness(persistent):
-    factory = batch_gemm_fp16 if persistent else batch_gemm_bf16
+@pytest.mark.parametrize("batch_owned", [False, True], ids=["distributed", "batch-owned"])
+def test_batch_gemm_correctness(batch_owned):
+    factory = batch_gemm_owned if batch_owned else batch_gemm_bf16
     kernel = tilelang.compile(factory(28, 2048, 2048, 2048), target="ascend", out_idx=-1)
     generator = torch.Generator().manual_seed(0)
-    dtype = torch.float16 if persistent else torch.bfloat16
+    dtype = torch.bfloat16
     a = torch.randint(-4, 5, (28, 2048, 2048), generator=generator).to(dtype) / 8
     b = torch.randint(-4, 5, (28, 2048, 2048), generator=generator).to(dtype) / 8
     actual = kernel(a.npu(), b.npu()).cpu()

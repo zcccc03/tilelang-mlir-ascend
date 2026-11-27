@@ -23,51 +23,53 @@ export TILELANG_DEFAULT_TARGET=ascend
 checkout, rather than a neighboring `tilelang` repository. These examples
 explicitly select `target="ascend"` and `execution_backend="tvm_ffi"`.
 
-## Fixed workload
+## Batch ownership comparison
 
-Both examples are specialized for B=28 and M=N=K=2048 on 28 Cube cores.
-Like `ascend_matmul`, the factory is `batch_gemm(batch, M, N, K)`.
-`main` explicitly sets batch=28 and M=N=K=2048; tuning values remain fixed
-inside the factory. Tile counts, swizzle indices and K loop counts are derived
-from these named dimensions. There is no shape or tuning CLI.
-L1 tiles are 256x256, L0 K is 64, both pipeline stages are fixed at two,
-K prefetch is enabled, and the swizzle window is four M tiles.
-There are eight M/N/K tiles, 64 output tiles per batch, and 1792 total.
-The two full swizzle windows need no tail-width clamp or last-window clamp.
+Both examples use BF16 A[batch,M,K] and B[batch,N,K], FP32 output,
+and explicitly set batch=28 and M=N=K=2048 in `main`.
+Their factories follow `batch_gemm(batch, M, N, K)` with fixed configuration:
 
-- `example_batch_gemm.py`: BF16 A[B,M,K] and B[B,N,K], FP32 output,
-  one 256x256 L0C accumulator (split M=1).
-- `example_batch_gemm_persistent.py`: FP16 A[B,M,K] and B[B,N,K],
-  FP32 output, two 128x256 L0C accumulators sharing B (split M=2).
+- batch_m=batch_n=batch_k=256; l0_k=64; split_m=1.
+- stages=2; K prefetch enabled; swizzle window=4.
+- Double-buffered L1/L0 operands and UnitFlag Cube/Fixpipe handoff.
 
-Both examples now load B in BNK layout using ND2NZ. The ordinary example
-previously used BKN, so its earlier board result does not measure this layout.
-The split values remain one and two respectively; the records do not establish
-the best split independently for each input layout and dtype.
-Both kernels use `T.Persistent`, double-buffered L1/L0 operands and UnitFlag.
-Shape, dtype, tile, core-count and pipeline command-line options are removed.
+All tile counts, offsets and loop bounds are derived from these dimensions.
+The two files differ in task assignment:
+
+| File | Assignment |
+| --- | --- |
+| `example_batch_gemm.py` | Distributes all batches' output tiles across 28 AICOREs. |
+| `example_batch_gemm_persistent.py` | Launches one worker per batch; core ID is batch ID, and that worker traverses every M/N tile of its batch. |
+
+At batch=28 both launch 28 AICORE workers and perform identical useful work.
+The batch-owned kernel retains the same local tile traversal and pipeline;
+its `T.Persistent` loop has one local worker starting at tile zero.
+This is a task-assignment comparison, with matching input layout, dtype,
+tiles, split, initialization and correctness reference (`A @ B.T`).
 
 ```bash
-# Compile without allocating tensors.
 python examples/gemm/example_batch_gemm.py --compile-only
 python examples/gemm/example_batch_gemm_persistent.py --compile-only
 
-# Run the fixed workload and check FP32 results on a real NPU.
 python examples/gemm/example_batch_gemm.py
 python examples/gemm/example_batch_gemm_persistent.py
-
-# Persistent hardware benchmark: 10 warmups, 30 repeats, 378 TFLOP/s peak.
-python examples/gemm/example_batch_gemm_persistent.py --bench
 
 python -m pytest examples/gemm/test_example_batch_gemm.py -q
 ```
 
-For board pipeline collection, run either file with the same profiling settings:
+Use identical settings for the real-board comparison:
 
 ```bash
 msopprof --warm-up=10 --aic-metrics=Roofline,InstrTimeline --launch-count=1 \
-  --output="$PWD/msopprof_out/batchgemm" \
+  --output="$PWD/msopprof_out/distributed" \
   python examples/gemm/example_batch_gemm.py
+
+msopprof --warm-up=10 --aic-metrics=Roofline,InstrTimeline --launch-count=1 \
+  --output="$PWD/msopprof_out/batch_owned" \
+  python examples/gemm/example_batch_gemm_persistent.py
 ```
 
+The batch-owned example also retains `--bench` (10 warmups, 30 repeats,
+378 TFLOP/s peak for the default 28 active cores). Do not compare that timing
+with a different collection protocol for the distributed example.
 Hardware tests skip when no Ascend NPU is available.
